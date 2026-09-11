@@ -1,0 +1,5 @@
+# 脚本必须保持 LF，否则在 Linux 上会报 ^M: bad interpreter
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.png binary
