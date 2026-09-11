@@ -32,6 +32,17 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 urllib.request.install_opener(_opener)
 
 
+def read_saved_token():
+    """本机已保存的令牌：~/.workbuddy/.github_token（用户明确要求记住）"""
+    p = os.path.join(os.path.expanduser("~"), ".workbuddy", ".github_token")
+    try:
+        if os.path.isfile(p):
+            return open(p, encoding="utf-8").read().strip()
+    except Exception:
+        pass
+    return ""
+
+
 def req(method, path, data=None, token=""):
     url = path if path.startswith("http") else API + path
     body = json.dumps(data, ensure_ascii=False).encode("utf-8") \
@@ -80,10 +91,12 @@ def main():
     token = os.environ.get("GH_TOKEN", "").strip()
     if args.token_file and os.path.isfile(args.token_file):
         token = open(args.token_file, encoding="utf-8").read().strip()
+    if not token:
+        token = read_saved_token()
     if not token and not args.dry_run:
-        print("缺少 GH_TOKEN。请先：")
+        print("缺少 GitHub 令牌。请先：")
         print("  https://github.com/settings/tokens  生成 classic token（勾 repo）")
-        print("  然后 export GH_TOKEN=ghp_xxx  再跑本脚本")
+        print("  然后 export GH_TOKEN=ghp_xxx，或把令牌存到 ~/.workbuddy/.github_token")
         return 2
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
