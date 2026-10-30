@@ -395,6 +395,205 @@ def get_local_nets(timeout=3.0):
 
 
 
+# ---------------------------------------------------------------------------
+#  运行日志 / 诊断报告
+#  出问题不用猜：程序一直在记日志，菜单里一键导出报告发给开发即可
+# ---------------------------------------------------------------------------
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".moyuya_chat.log")
+LOG_MAX_BYTES = 512 * 1024        # 超过就滚动裁剪，避免无限增长
+LOG_KEEP_BYTES = 256 * 1024
+_log_lock = threading.Lock()
+
+
+def _roll_log():
+    """日志太大时保留后半段"""
+    try:
+        if os.path.isfile(LOG_PATH) \
+                and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            with open(LOG_PATH, "rb") as f:
+                f.seek(-LOG_KEEP_BYTES, 2)
+                data = f.read()
+            with open(LOG_PATH, "wb") as f:
+                f.write(b"...(earlier log omitted)...\n"
+                        + data.split(b"\n", 1)[-1])
+    except Exception:
+        pass
+
+
+def log_line(msg, exc=False):
+    """记一行运行日志。exc=True 时把当前异常堆栈一并写入。"""
+    try:
+        import traceback
+        with _log_lock:
+            _roll_log()
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+                if exc:
+                    f.write(traceback.format_exc())
+    except Exception:
+        pass
+
+
+def install_log_hooks():
+    """把没人接住的异常也写进日志（主线程 + 子线程）。"""
+    import traceback
+    base_hook = sys.__excepthook__
+
+    def hook(etype, value, tb):
+        try:
+            with _log_lock:
+                _roll_log()
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write("[%s] 未捕获异常：%s: %s\n%s"
+                            % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               getattr(etype, "__name__", etype), value,
+                               "".join(traceback.format_exception(
+                                   etype, value, tb))))
+        except Exception:
+            pass
+        try:
+            base_hook(etype, value, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = hook
+
+    def thread_hook(a):
+        try:
+            with _log_lock:
+                _roll_log()
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write("[%s] 线程 %s 未捕获异常：%s: %s\n%s"
+                            % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               getattr(getattr(a, "thread", None),
+                                       "name", "?"),
+                               getattr(a.exc_type, "__name__", a.exc_type),
+                               a.exc_value,
+                               "".join(traceback.format_exception(
+                                   a.exc_type, a.exc_value,
+                                   a.exc_traceback))))
+        except Exception:
+            pass
+
+    try:
+        threading.excepthook = thread_hook
+    except Exception:
+        pass
+
+
+def build_report(extra=None, tail_lines=400):
+    """生成诊断报告文本：环境 + 网卡 + 端口 + 运行状态 + 最近日志。"""
+    import platform
+    line = []
+    add = line.append
+    add("=" * 66)
+    add(" 摸鱼鸭 · 欸~你听说没~   诊断报告")
+    add(" 生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    add("=" * 66)
+    add("")
+    add("【环境】")
+    add("  系统      : %s" % platform.platform())
+    add("  Python    : %s" % sys.version.replace("\n", " "))
+    qt = globals().get("QT", "?")
+    add("  界面库    : %s" % qt)
+    try:
+        if qt == "PyQt5":
+            from PyQt5.QtCore import QT_VERSION_STR, PYQT_VERSION_STR
+            add("  Qt / PyQt : %s / %s" % (QT_VERSION_STR, PYQT_VERSION_STR))
+        elif qt == "PySide6":
+            from PySide6.QtCore import __version__ as _v
+            add("  PySide6   : %s" % _v)
+    except Exception:
+        pass
+    add("  程序位置  : %s" % os.path.abspath(sys.argv[0] if sys.argv else ""))
+    add("  家目录    : %s" % os.path.expanduser("~"))
+
+    add("")
+    add("【本机网卡】")
+    try:
+        nics = _collect_nets()
+        if nics:
+            for ip, bits, bcast, name, method in nics:
+                add("  %-15s /%-2d  广播 %-15s %-9s [%s]"
+                    % (ip, bits, bcast, name or "-", method))
+        else:
+            add("  没识别到任何网卡 —— 界面会显示 127.0.0.1，也扫不到人")
+    except Exception as e:
+        add("  获取失败：%r" % (e,))
+
+    add("")
+    add("【端口】")
+    for port in (DEFAULT_PORT, DEFAULT_PORT + 1):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.close()
+            udp = "UDP 可绑定"
+        except Exception as e:
+            udp = "UDP 不可用（%s）" % e
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            s.listen(1)
+            s.close()
+            tcp = "TCP 可监听"
+        except Exception as e:
+            tcp = "TCP 不可用（%s）" % e
+        add("  %d : %s，%s" % (port, tcp, udp))
+
+    if extra:
+        add("")
+        add("【运行状态】")
+        for ln in extra:
+            add("  " + str(ln))
+
+    add("")
+    add("【最近日志 · %s】" % LOG_PATH)
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        if lines:
+            for ln in lines[-tail_lines:]:
+                add("  " + ln)
+        else:
+            add("  （日志为空）")
+    except Exception as e:
+        add("  （读不到日志：%r）" % (e,))
+
+    add("")
+    add("=" * 66)
+    add("把以上内容发给开发即可。若含敏感信息，请先自行删改。")
+    add("=" * 66)
+    return "\n".join(line)
+
+
+def save_report(extra=None, path=None):
+    """把报告写成文本文件，返回路径。默认放在家目录。"""
+    txt = build_report(extra)
+    if not path:
+        path = os.path.join(
+            os.path.expanduser("~"),
+            "摸鱼鸭诊断报告-%s.txt"
+            % datetime.now().strftime("%Y%m%d-%H%M%S"))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    return path
+
+
+def report_cli():
+    """命令行：python3 摸鱼鸭聊天版.py --report"""
+    p = save_report()
+    print("诊断报告已生成：")
+    print("  " + p)
+    print("把这个文件发给开发即可（里面不含聊天内容，只含环境、网卡、端口、日志）。")
+    return 0
+
+
+
+
 def expand_targets(spec, limit=1024):
     """把网段写法展开成 IP 列表。
     支持：192.168.1        -> 192.168.1.1 ~ .254
@@ -633,6 +832,7 @@ class ChatNode(object):
             s.listen(16)
             s.settimeout(0.5)
         except Exception as e:
+            log_line("监听端口 %s 失败：%s" % (port, e))
             return False, "监听端口 %s 失败：%s" % (port, e)
         self.server_sock = s
         self.port = s.getsockname()[1]
@@ -641,6 +841,8 @@ class ChatNode(object):
         t = threading.Thread(target=self._accept_loop, daemon=True)
         t.start()
         self.start_discovery()
+        log_line("开始监听 TCP %d，UDP 发现端口 %s"
+                 % (self.port, getattr(self, "_disc_port", "?")))
         return True, "监听端口 %d" % self.port
 
     # ---------------- 局域网广播发现 ----------------
@@ -768,7 +970,10 @@ class ChatNode(object):
         while time.time() < deadline:
             time.sleep(0.1)
         with self._disc_lock:
-            return list(self._disc_hits.values())
+            hits = list(self._disc_hits.values())
+        log_line("广播发现：向 %d 个广播地址发了询问（%s），收到 %d 个应答"
+                 % (len(addrs), "、".join(sorted(addrs)) or "无", len(hits)))
+        return hits
 
     @staticmethod
     def _bcasts_of(spec):
@@ -816,6 +1021,7 @@ class ChatNode(object):
         ip = (ip or "").strip()
 
         def fail(msg):
+            log_line("连接 %s:%s 失败：%s" % (ip, port, msg))
             if not quiet:
                 self.emit("error", msg=msg)
             return False
@@ -861,6 +1067,8 @@ class ChatNode(object):
                                 hdr.get("port", port), True)
                     peer.name = hdr.get("name", "")
                     self._register(peer)
+                    log_line("已连接 %s:%s（对方昵称：%s）"
+                             % (ip, port, peer.name or "-"))
             if not keep:
                 sock.close()
                 return True
@@ -2321,7 +2529,9 @@ def diag():
     except Exception as e:
         print("广播测试  : 异常 -> %s" % e)
 
+    print("日志文件  : %s" % LOG_PATH)
     print("-" * 58)
+    print("要发给开发看：python3 摸鱼鸭聊天版.py --report 导出诊断报告")
     print("说明：本程序为纯本地点对点通信，不连接任何外部服务器。")
     print("      若系统安全软件弹出联网/监听询问，请选择「允许」")
     print("      （它需要监听端口供对方连入，这是正常工作方式）。")

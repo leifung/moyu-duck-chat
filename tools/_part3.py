@@ -1074,7 +1074,59 @@ class ChatWindow(QMainWindow):
         a = QAction("关于", self)
         a.triggered.connect(self.about)
         m_help.addAction(a)
+        a = QAction("导出诊断报告…", self)
+        a.setToolTip("把运行环境、网卡、端口和最近日志导出成一个文本文件，"
+                     "发给开发排查问题")
+        a.triggered.connect(self.export_report)
+        m_help.addAction(a)
+        a = QAction("打开运行日志…", self)
+        a.triggered.connect(self.open_log)
+        m_help.addAction(a)
         self.refresh_offwork_action()
+
+    def export_report(self):
+        extra = []
+        try:
+            extra.append("监听状态：%s（端口 %s）"
+                         % ("监听中" if self.node.running else "未启动",
+                            self.node.port or "-"))
+            extra.append("本机 IP（界面显示）：%s"
+                         % (self.ip_combo.currentText() or "-"))
+            extra.append("已连接 %d 人：%s"
+                         % (len(self.node.peer_list()),
+                            "、".join(sorted(self.node.peer_list())) or "无"))
+        except Exception:
+            pass
+        try:
+            path = save_report(extra)
+            log_line("已导出诊断报告：%s" % path)
+            QMessageBox.information(
+                self, "诊断报告已导出",
+                "报告已保存到：\n\n%s\n\n把这个文件发给开发即可。\n"
+                "里面只有环境、网卡、端口和日志，不含聊天内容。\n\n"
+                "（命令行也可以生成：python3 摸鱼鸭聊天版.py --report）"
+                % path)
+        except Exception as e:
+            log_line("导出诊断报告失败", exc=True)
+            QMessageBox.warning(self, "导出失败", "生成报告时出错：\n%s" % e)
+
+    def open_log(self):
+        import subprocess
+        path = LOG_PATH
+        try:
+            if not os.path.isfile(path):
+                open(path, "a", encoding="utf-8").close()
+            if sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                os.startfile(path)  # noqa: S606
+        except Exception as e:
+            log_line("打开日志失败：%s" % e)
+            QMessageBox.information(self, "运行日志",
+                                    "日志文件在这里：\n%s\n\n（打开失败：%s）"
+                                    % (path, e))
 
     def refresh_offwork_action(self):
         self.act_offwork.setText("自定义下班时间（当前 %02d:%02d）…"
@@ -1113,13 +1165,15 @@ class ChatWindow(QMainWindow):
         if ips:
             self.ip_combo.setCurrentIndex(0)
         if not ips or ips == ["127.0.0.1"]:
+            log_line("警告：没识别到局域网 IP（get_local_ips 只返回 %s）" % ips)
             self.ctrl.bridge.status.emit("没识别到局域网 IP（只有 127.0.0.1）")
             self.sys_msg(
                 "⚠ 没识别到局域网 IP：请确认网线/WiFi 已连上并拿到了 IP，"
                 "然后点「刷新 IP」。")
-            self.sys_msg("  还是不行就跑一次诊断看详情："
-                         "python3 摸鱼鸭聊天版.py --diag")
+            self.sys_msg("  还是不行：帮助 → 导出诊断报告，把报告发给开发"
+                         "（或跑 python3 摸鱼鸭聊天版.py --diag）")
             return
+        log_line("本机 IP：%s" % "、".join(ips))
         self.ctrl.bridge.status.emit("本机 IP：" + "、".join(ips))
 
     # ---------------- 监听 ----------------
@@ -1267,6 +1321,10 @@ class ChatWindow(QMainWindow):
             pass
         ok_ips = [ip for ip, v in seen.items() if v["ok"]]
         bad_ips = [ip for ip, v in seen.items() if not v["ok"]]
+        log_line("扫描结束：网段 %s，深度=%s；连上 %d 台 [%s]，"
+                 "看到但连不上 [%s]"
+                 % ("、".join(nets), deep, len(ok_ips),
+                    "、".join(sorted(ok_ips)), "、".join(sorted(bad_ips))))
         if ok_ips:
             self.sys_msg("扫描完成，已连上 %d 台：%s"
                          % (len(ok_ips), "、".join(sorted(ok_ips))))
@@ -1958,10 +2016,37 @@ class Controller(object):
         menu.addAction("立刻放一条鱼", self.spawn_fish)
         menu.addAction("数一数摸鱼值", self.show_score)
         menu.addSeparator()
+        menu.addAction("导出诊断报告…", self.export_report_tray)
+        menu.addSeparator()
         menu.addAction("退出", self.quit)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
+
+    def export_report_tray(self):
+        """托盘菜单导出报告（窗口打不开时也能用）"""
+        extra = []
+        try:
+            extra.append("监听状态：%s（端口 %s）"
+                         % ("监听中" if self.win.node.running else "未启动",
+                            self.win.node.port or "-"))
+            extra.append("已连接 %d 人：%s"
+                         % (len(self.win.node.peer_list()),
+                            "、".join(sorted(self.win.node.peer_list())) or "无"))
+        except Exception:
+            pass
+        try:
+            path = save_report(extra)
+            log_line("已导出诊断报告：%s" % path)
+            self.tray.showMessage(
+                "诊断报告已导出",
+                "已保存到 %s\n把这个文件发给开发即可。" % path,
+                QSystemTrayIcon.Information
+                if hasattr(QSystemTrayIcon, "Information")
+                else QSystemTrayIcon.MessageIcon.Information,
+                6000)
+        except Exception:
+            log_line("导出诊断报告失败", exc=True)
 
     def _tray_activated(self, reason):
         try:
@@ -1985,6 +2070,7 @@ class Controller(object):
         self.save()
 
     def quit(self):
+        log_line("程序退出")
         try:
             if self.stage is not None:
                 self.stage.stop()
@@ -2089,12 +2175,23 @@ def main():
     ap.add_argument("--make-icon", metavar="PNG", help="生成图标后退出")
     ap.add_argument("--selftest", action="store_true", help="网络层自检")
     ap.add_argument("--diag", action="store_true", help="环境诊断")
+    ap.add_argument("--report", action="store_true",
+                    help="导出诊断报告（环境/网卡/端口/日志）后退出")
     args = ap.parse_args()
 
+    install_log_hooks()
+    log_line("=" * 50)
+    log_line("程序启动（%s）参数：%s"
+             % (APP_TITLE, " ".join(sys.argv[1:]) or "无"))
+
     if args.selftest:
+        log_line("运行网络层自检")
         return selftest()
     if args.diag:
+        log_line("运行环境诊断")
         return diag()
+    if args.report:
+        return report_cli()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
