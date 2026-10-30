@@ -9,6 +9,7 @@
 
 import html as _html
 import importlib as _il
+import re as _re
 
 _QTPKG = QT                                   # PyQt5 / PySide6 / PyQt6
 _qtcore = _il.import_module(_QTPKG + ".QtCore")
@@ -1234,9 +1235,56 @@ class ChatWindow(QMainWindow):
         except Exception:
             pass
         self.ctrl.save()
-        self.statusBar().showMessage("正在连接 %s:%s ..." % (ip, port))
-        threading.Thread(target=self.node.connect, args=(ip, port),
-                         daemon=True).start()
+        try:
+            port_i = int(port) if str(port).strip() else DEFAULT_PORT
+        except Exception:
+            port_i = DEFAULT_PORT
+        my_port = self.node.port or DEFAULT_PORT
+        self.statusBar().showMessage("正在连接 %s:%d ..." % (ip, port_i))
+
+        def work():
+            if self.node.connect(ip, port_i, timeout=6):
+                return
+            # 连不上时再探一次端口，把「拒绝」和「超时」分开 —— 这两种
+            # 的排查方向完全不同，混在一起说只会让人无从下手
+            state = "dead"
+            try:
+                state = probe_port(ip, port_i, 1.5)
+            except Exception:
+                pass
+            myself = _re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and \
+                ip in [x for x in get_local_ips()]
+            QTimer.singleShot(0, lambda: self._connect_fail_hint(
+                ip, port_i, state, bool(myself), my_port))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _connect_fail_hint(self, ip, port, state, is_self, my_port):
+        if is_self:
+            self.sys_msg("⚠ %s 就是本机自己的 IP，连自己没意义。"
+                         "把对方的 IP 填在这里。" % ip)
+            return
+        if state == "closed":
+            self.sys_msg("连不上 %s:%d，但对方电脑有回应（回的是「拒绝连接」）——"
+                         "说明网络是通的、机器在线，只是那个端口上没有程序在听。"
+                         % (ip, port))
+            self.sys_msg("  请让对方逐条确认：")
+            self.sys_msg("  ① 对方点过「启动监听」了吗？界面顶上要显示绿字"
+                         "「● 监听中 xxxxx」；")
+            self.sys_msg("  ② 对方实际用的端口是不是 %d？让他把界面上显示的"
+                         "那个端口号报给你，填进上面的「端口」框；" % port)
+            self.sys_msg("  ③ 对方防火墙有没有拦这个端口。"
+                         "统信可在终端执行：sudo ufw allow %d/tcp" % port)
+        else:
+            self.sys_msg("连不上 %s:%d，而且对方完全没回应（超时）——"
+                         "三种可能：IP 填错了 / 对方没开机 / "
+                         "包被防火墙或网络隔离静默丢掉了。" % (ip, port))
+            self.sys_msg("  先确认能不能通：ping %s" % ip)
+            self.sys_msg("  ping 不通 → 找网管放通；"
+                         "ping 得通但仍连不上 → 对方防火墙拦了端口，"
+                         "让他执行 sudo ufw allow %d/tcp" % port)
+            self.sys_msg("  另外：本机监听端口是 %d，对方连你的时候也要填这个。"
+                         % my_port)
 
     def scan_lan(self):
         if not self.node.running:
@@ -1244,8 +1292,11 @@ class ChatWindow(QMainWindow):
             return
         nets = []
         spec = self.scan_net.text().strip()
-        if spec:
-            nets.append(spec)
+        # 支持一次填多个网段：逗号、分号、空格都行，例如 "100.58.217, 100.58.218"
+        for one in _re.split(r"[,;，；\s]+", spec):
+            one = one.strip()
+            if one and one not in nets:
+                nets.append(one)
         if not nets:
             for ip, bits, _c in get_local_nets(timeout=1.5):
                 if ip.startswith("127."):
@@ -1264,6 +1315,16 @@ class ChatWindow(QMainWindow):
             self.sys_msg("没检测到局域网 IP，无法扫描：先点「刷新 IP」确认能拿到 IP；"
                          "也可以直接在「网段」里手填，例如 192.168.5")
             return
+        # 对方 IP 如果不在上面任何一个网段里，把它所在的 /24 也加进来扫。
+        # （跨网段是最常见的「明明都开着却互相扫不到」的原因：广播不跨网段，
+        #   只扫自己这一段自然永远找不到对方。）
+        pip = self.peer_ip.text().strip()
+        if pip and _re.match(r"^\d+\.\d+\.\d+\.\d+$", pip):
+            pnet = ".".join(pip.split(".")[:3])
+            if pnet not in nets:
+                nets.append(pnet)
+                self.sys_msg("注意：你填的对方 IP %s 不在本机网段里，"
+                             "已把它所在的 %s.* 也加进本次扫描。" % (pip, pnet))
         try:
             port = int(self.peer_port.text().strip() or DEFAULT_PORT)
         except Exception:
