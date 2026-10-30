@@ -883,7 +883,14 @@ class ChatWindow(QMainWindow):
         top.addWidget(QLabel("本机 IP"))
         self.ip_combo = QComboBox()
         self.ip_combo.setFixedWidth(140)
+        self.ip_combo.setToolTip(
+            "把这个 IP 告诉对方。\n若显示 127.0.0.1，说明没识别到网卡，"
+            "点「刷新 IP」重试。")
         top.addWidget(self.ip_combo)
+        self.btn_ip = QPushButton("刷新 IP")
+        self.btn_ip.setFixedWidth(70)
+        self.btn_ip.clicked.connect(self.refresh_ips)
+        top.addWidget(self.btn_ip)
 
         top.addWidget(QLabel("端口"))
         self.port_edit = QLineEdit(str(self.cfg.get("port", DEFAULT_PORT)))
@@ -1091,11 +1098,10 @@ class ChatWindow(QMainWindow):
 
     def refresh_ips(self):
         self.ip_combo.clear()
-        self.ip_combo.addItem("127.0.0.1")
+        self.ip_combo.addItem("检测中…")
 
         def work():
             ips = get_local_ips()
-            self.ctrl.bridge.status.emit("本机 IP：" + "、".join(ips))
             QTimer.singleShot(0, lambda: self._set_ips(ips))
 
         threading.Thread(target=work, daemon=True).start()
@@ -1106,6 +1112,15 @@ class ChatWindow(QMainWindow):
             self.ip_combo.addItem(ip)
         if ips:
             self.ip_combo.setCurrentIndex(0)
+        if not ips or ips == ["127.0.0.1"]:
+            self.ctrl.bridge.status.emit("没识别到局域网 IP（只有 127.0.0.1）")
+            self.sys_msg(
+                "⚠ 没识别到局域网 IP：请确认网线/WiFi 已连上并拿到了 IP，"
+                "然后点「刷新 IP」。")
+            self.sys_msg("  还是不行就跑一次诊断看详情："
+                         "python3 摸鱼鸭聊天版.py --diag")
+            return
+        self.ctrl.bridge.status.emit("本机 IP：" + "、".join(ips))
 
     # ---------------- 监听 ----------------
     def auto_start(self):
@@ -1173,13 +1188,22 @@ class ChatWindow(QMainWindow):
         if spec:
             nets.append(spec)
         if not nets:
-            for ip, _b, _c in get_local_nets(timeout=1.5):
+            for ip, bits, _c in get_local_nets(timeout=1.5):
                 if ip.startswith("127."):
                     continue
+                # 掩码比 /24 大时按真实网段来，否则会漏掉同网段的机器
+                if bits and bits < 24:
+                    try:
+                        import ipaddress
+                        nets.append(str(ipaddress.IPv4Network(
+                            "%s/%d" % (ip, bits), strict=False)))
+                        continue
+                    except Exception:
+                        pass
                 nets.append(".".join(ip.split(".")[:3]))
         if not nets:
-            self.sys_msg("没检测到局域网 IP，无法扫描；可在「网段」里手填，"
-                         "例如 192.168.5")
+            self.sys_msg("没检测到局域网 IP，无法扫描：先点「刷新 IP」确认能拿到 IP；"
+                         "也可以直接在「网段」里手填，例如 192.168.5")
             return
         try:
             port = int(self.peer_port.text().strip() or DEFAULT_PORT)

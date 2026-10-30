@@ -43,6 +43,21 @@ def read_saved_token():
     return ""
 
 
+def pick_token(cands):
+    """挑一个真正能用的令牌：环境变量里可能留着已吊销的旧令牌，
+    而 ~/.workbuddy/.github_token 里是后来换的新令牌。"""
+    for t in cands:
+        t = (t or "").strip()
+        if not t:
+            continue
+        try:
+            req("GET", "/user", token=t)
+            return t
+        except Exception:
+            continue
+    return ""
+
+
 def req(method, path, data=None, token=""):
     url = path if path.startswith("http") else API + path
     body = json.dumps(data, ensure_ascii=False).encode("utf-8") \
@@ -88,11 +103,10 @@ def main():
     ap.add_argument("--token-file", default="")
     args = ap.parse_args()
 
-    token = os.environ.get("GH_TOKEN", "").strip()
+    cands = [os.environ.get("GH_TOKEN", ""), read_saved_token()]
     if args.token_file and os.path.isfile(args.token_file):
-        token = open(args.token_file, encoding="utf-8").read().strip()
-    if not token:
-        token = read_saved_token()
+        cands.insert(0, open(args.token_file, encoding="utf-8").read())
+    token = pick_token(cands) if not args.dry_run else ""
     if not token and not args.dry_run:
         print("缺少 GitHub 令牌。请先：")
         print("  https://github.com/settings/tokens  生成 classic token（勾 repo）")

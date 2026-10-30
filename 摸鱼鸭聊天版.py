@@ -125,56 +125,260 @@ def pick_font(size=10):
     return ("Sans", size)
 
 
-def get_local_ips(timeout=3.0):
-    """获取本机所有可用 IPv4 地址（优先返回局域网地址）。
-    整体带超时保护：任何情况下都不会把程序卡在启动阶段。"""
-    box = []
+def _mask_to_bits(mask):
+    """子网掩码 -> 前缀长度"""
+    try:
+        return bin(struct.unpack("!I", socket.inet_aton(mask))[0]).count("1")
+    except Exception:
+        return 24
 
-    def work():
-        found = []
-        # 方法 1：解析本地网卡（ip addr / ifconfig），最快最可靠
-        for cmd in (["ip", "-4", "addr"], ["ifconfig", "-a"]):
-            try:
-                import subprocess
-                out = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, timeout=2)
-                txt = (out.stdout or b"").decode("utf-8", "ignore")
-                for line in txt.splitlines():
-                    line = line.strip()
-                    hit = None
-                    if line.startswith("inet "):
-                        hit = line.split()[1].split("/")[0]
-                    elif "inet addr:" in line or "inet " in line:
-                        for part in line.split():
-                            if part.startswith("addr:"):
-                                hit = part[5:]
-                                break
-                    if hit and hit not in found and not hit.startswith("127."):
-                        found.append(hit)
-                if found:
-                    break
-            except Exception:
+
+def _calc_bcast(ip, bits):
+    """由 IP + 前缀长度推算广播地址"""
+    try:
+        import ipaddress
+        return str(ipaddress.IPv4Network("%s/%d" % (ip, bits),
+                                         strict=False).broadcast_address)
+    except Exception:
+        try:
+            num = struct.unpack("!I", socket.inet_aton(ip))[0]
+            m = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+            return socket.inet_ntoa(struct.pack("!I", num | (~m & 0xFFFFFFFF)))
+        except Exception:
+            return ".".join(ip.split(".")[:3]) + ".255"
+
+
+def _run_cmd(cmd, timeout=2.0):
+    """跑命令取输出。PATH 补上 /sbin、/usr/sbin：
+    统信 UOS / 麒麟 上 ip、ifconfig 常常不在普通用户的 PATH 里。"""
+    env = os.environ.copy()
+    env["PATH"] = (env.get("PATH", "") + os.pathsep
+                   + "/sbin:/usr/sbin:/bin:/usr/bin")
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL,
+                           timeout=timeout, env=env)
+        return (p.stdout or b"").decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _nics_linux_ioctl():
+    """Linux：/proc/net/dev 列接口名 + ioctl 取 IP / 掩码 / 广播。
+    纯标准库，不依赖 ip 命令、不需要 root，离线环境照样能用。"""
+    try:
+        import fcntl
+    except Exception:
+        return []
+    SIOCGIFFLAGS, SIOCGIFADDR = 0x8913, 0x8915
+    SIOCGIFBRDADDR, SIOCGIFNETMASK = 0x8919, 0x891B
+    names = []
+    try:
+        with open("/proc/net/dev", "r") as f:
+            for ln in f.read().splitlines()[2:]:
+                if ":" in ln:
+                    n = ln.split(":")[0].strip()
+                    if n:
+                        names.append(n)
+    except Exception:
+        return []
+    # 虚拟网卡（docker/虚拟机/VPN）优先让位给物理网卡
+    VIRT = ("docker", "virbr", "veth", "br-", "tun", "tap", "vmnet",
+            "vboxnet", "lxcbr", "kube", "cni", "flannel", "zt",
+            "tailscale", "utun", "ppp")
+    all_nic, phys = [], []
+    for name in names:
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            ifn = name.encode("utf-8")[:15]
+            pack = struct.pack("256s", ifn)
+            flags = struct.unpack(
+                "H", fcntl.ioctl(s.fileno(), SIOCGIFFLAGS, pack)[16:18])[0]
+            if not (flags & 0x1) or (flags & 0x8):      # 未启用 / 回环
                 continue
-        # 方法 2：UDP 探测出口网卡（不真正发包，仅查路由表）
+            ip = socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), SIOCGIFADDR, pack)[20:24])
+            mask = socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), SIOCGIFNETMASK, pack)[20:24])
+            try:
+                bcast = socket.inet_ntoa(
+                    fcntl.ioctl(s.fileno(), SIOCGIFBRDADDR, pack)[20:24])
+            except Exception:
+                bcast = "0.0.0.0"
+            if not ip or ip.startswith(("127.", "0.", "169.254.")):
+                continue
+            bits = _mask_to_bits(mask)
+            if not bcast or bcast.startswith(("0.", "127.")):
+                bcast = _calc_bcast(ip, bits)
+            rec = (ip, bits, bcast, name, "ioctl")
+            all_nic.append(rec)
+            if not name.startswith(VIRT):
+                phys.append(rec)
+        except Exception:
+            continue
+        finally:
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+    return phys if phys else all_nic
+
+
+def _nics_ip_cmd():
+    """解析 `ip -4 -o addr show`"""
+    out = []
+    txt = _run_cmd(["ip", "-4", "-o", "addr", "show"])
+    for line in txt.splitlines():
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if not m:
+            continue
+        ip, bits = m.group(1), int(m.group(2))
+        bm = re.search(r"brd\s+(\d+\.\d+\.\d+\.\d+)", line)
+        nm = re.search(r"^\d+:\s+(\S+)", line)
+        out.append((ip, bits,
+                    (bm.group(1) if bm else "") or _calc_bcast(ip, bits),
+                    (nm.group(1) if nm else ""), "ip"))
+    return out
+
+
+def _nics_ifconfig():
+    """解析 ifconfig -a（macOS / 老 Linux）"""
+    out = []
+    txt = _run_cmd(["ifconfig", "-a"])
+    cur, ip, mask, bcast = "", "", "", ""
+
+    def flush():
+        if ip:
+            bits = _mask_to_bits(mask) if mask else 24
+            out.append((ip, bits, bcast or _calc_bcast(ip, bits),
+                        cur, "ifconfig"))
+
+    for line in txt.splitlines():
+        if line and not line[0].isspace():
+            flush()
+            cur, ip, mask, bcast = line.split(":")[0].strip(), "", "", ""
+        m = re.search(r"inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            ip = m.group(1)
+        m = re.search(r"(?:netmask|Mask:)\s*(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            mask = m.group(1)
+        m = re.search(r"(?:broadcast|Bcast:)\s*(\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            bcast = m.group(1)
+    flush()
+    return out
+
+
+def _nics_ipconfig():
+    """Windows：解析 ipconfig 的 IPv4 地址 + 子网掩码"""
+    raw = b""
+    try:
+        p = subprocess.run(["ipconfig"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=5)
+        raw = p.stdout or b""
+    except Exception:
+        return []
+    txt = ""
+    for enc in ("utf-8", "gbk", "mbcs", "latin-1"):
+        try:
+            t = raw.decode(enc)
+            if "IPv4" in t or "IP Address" in t or "地址" in t:
+                txt = t
+                break
+        except Exception:
+            continue
+    if not txt:
+        return []
+    out, ip = [], ""
+    for line in txt.splitlines():
+        if ("IPv4" in line) or ("IP Address" in line):
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line.split(":")[-1])
+            ip = m.group(1) if m else ""
+        elif ("子网掩码" in line) or ("Subnet Mask" in line):
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line.split(":")[-1])
+            if m and ip:
+                bits = _mask_to_bits(m.group(1))
+                out.append((ip, bits, _calc_bcast(ip, bits), "", "ipconfig"))
+                ip = ""
+    return out
+
+
+def _nics_probe():
+    """UDP 探测出口网卡（不真发包，只查路由表）；需要默认路由，
+    所以离线/内网机器上可能拿不到，只作兜底。"""
+    for target in ("223.5.5.5", "10.255.255.255", "192.168.255.255"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(1)
-            s.connect(("223.5.5.5", 80))
+            s.connect((target, 80))
             ip = s.getsockname()[0]
             s.close()
-            if ip and ip not in found and not ip.startswith("127."):
-                found.append(ip)
+            if ip and not ip.startswith(("127.", "0.", "169.254.")):
+                return [(ip, 24, _calc_bcast(ip, 24), "", "probe")]
         except Exception:
-            pass
-        # 方法 3：主机名解析
-        if not found:
-            try:
-                hn = socket.gethostbyname(socket.gethostname())
-                if hn and not hn.startswith("127."):
-                    found.append(hn)
-            except Exception:
-                pass
-        box.extend(found if found else ["127.0.0.1"])
+            continue
+    return []
+
+
+def _nics_hostname():
+    """最后兜底：主机名解析（Debian 系常把主机名指向 127.0.1.1，会被过滤）"""
+    try:
+        _n, _a, ips = socket.gethostbyname_ex(socket.gethostname())
+    except Exception:
+        return []
+    return [(ip, 24, _calc_bcast(ip, 24), "", "hostname")
+            for ip in ips
+            if not ip.startswith(("127.", "0.", "169.254."))]
+
+
+def _collect_nets():
+    """按可靠程度依次尝试，返回 [(ip, bits, bcast, ifname, method)]
+    （已排除回环 / 链路本地地址，局域网网段排在前面）。"""
+    found = []
+    for fn in (_nics_linux_ioctl, _nics_ip_cmd, _nics_ifconfig,
+               _nics_ipconfig, _nics_probe, _nics_hostname):
+        try:
+            got = [r for r in fn()
+                   if r and r[0]
+                   and not r[0].startswith(("127.", "0.", "169.254."))]
+        except Exception:
+            got = []
+        for r in got:
+            if r[0] not in [x[0] for x in found]:
+                found.append(r)
+        if found:
+            break
+
+    def rank(r):
+        ip = r[0]
+        try:
+            a, b = (int(x) for x in ip.split(".")[:2])
+        except Exception:
+            return (9, ip)
+        if ip.startswith("192.168."):
+            k = 0
+        elif ip.startswith("10."):
+            k = 1
+        elif a == 172 and 16 <= b <= 31:
+            k = 2
+        else:
+            k = 3
+        return (k, ip)
+
+    found.sort(key=rank)
+    return found
+
+
+def get_local_ips(timeout=3.0):
+    """本机可用 IPv4（局域网优先）。与扫描网段取自同一份结果，
+    不会出现「显示一个 IP、却扫另一个网段」的情况。"""
+    box = []
+
+    def work():
+        box.extend([n[0] for n in _collect_nets()])
 
     t = threading.Thread(target=work, daemon=True)
     t.start()
@@ -183,65 +387,21 @@ def get_local_ips(timeout=3.0):
 
 
 def get_local_nets(timeout=3.0):
-    """返回本机各网卡的网段信息 [(ip, prefix, broadcast), ...]。
-    广播发现与网段扫描都依赖它：只有拿到正确的广播地址，才能找到同网段的人。
-    """
-    nets = []
+    """[(ip, prefix, broadcast), ...]：广播发现与网段扫描都依赖它，
+    只有拿到正确的广播地址，才能找到同网段的人。"""
     box = []
 
     def work():
-        found = []
-        try:
-            out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, timeout=2)
-            txt = (out.stdout or b"").decode("utf-8", "ignore")
-            for line in txt.splitlines():
-                m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
-                if not m:
-                    continue
-                ip, bits = m.group(1), int(m.group(2))
-                if ip.startswith("127."):
-                    continue
-                bm = re.search(r"brd\s+(\d+\.\d+\.\d+\.\d+)", line)
-                bcast = bm.group(1) if bm else None
-                if not bcast:
-                    try:
-                        import ipaddress
-                        bcast = str(ipaddress.IPv4Network(
-                            "%s/%d" % (ip, bits), strict=False)
-                            .broadcast_address)
-                    except Exception:
-                        bcast = ".".join(ip.split(".")[:3]) + ".255"
-                if ip not in [n[0] for n in found]:
-                    found.append((ip, bits, bcast))
-        except Exception:
-            pass
-        if not found:
-            # ifconfig 回退：无 ip 命令时，按常见 /24 推算广播地址
-            try:
-                out = subprocess.run(["ifconfig", "-a"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, timeout=2)
-                txt = (out.stdout or b"").decode("utf-8", "ignore")
-                for m in re.finditer(r"inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)"
-                                     r".*?(?:Bcast:|broadcast\s+)"
-                                     r"(\d+\.\d+\.\d+\.\d+)", txt):
-                    ip, bcast = m.group(1), m.group(2)
-                    if not ip.startswith("127."):
-                        found.append((ip, 24, bcast))
-            except Exception:
-                pass
-        if not found:
-            for ip in get_local_ips():
-                if not ip.startswith("127."):
-                    found.append((ip, 24, ".".join(ip.split(".")[:3]) + ".255"))
-        box.extend(found)
-        box.append(("127.0.0.1", 8, "127.0.0.1"))
+        for ip, bits, bcast, _n, _m in _collect_nets():
+            box.append((ip, bits, bcast or _calc_bcast(ip, bits)))
 
     t = threading.Thread(target=work, daemon=True)
     t.start()
     t.join(timeout)
+    box.append(("127.0.0.1", 8, "127.0.0.1"))
     return box if box else [("127.0.0.1", 8, "127.0.0.1")]
+
+
 
 
 def expand_targets(spec, limit=1024):
@@ -597,18 +757,22 @@ class ChatNode(object):
             for b in self._bcasts_of(spec):
                 addrs.add(b)
         addrs.add("255.255.255.255")
-        for b in list(addrs):
+        # 广播容易丢，发两轮（隔 0.3 秒），显著提高一次扫到的概率
+        for _round in range(2):
+            for b in list(addrs):
+                for p in range(DISC_PORT_BASE, DISC_PORT_BASE + DISC_PORT_SPAN):
+                    try:
+                        self._disc_sock.sendto(payload, (b, p))
+                    except Exception:
+                        pass
+            # 同机多开时广播可能不通，补一轮本机单播，保证自己人一定能互相看见
             for p in range(DISC_PORT_BASE, DISC_PORT_BASE + DISC_PORT_SPAN):
                 try:
-                    self._disc_sock.sendto(payload, (b, p))
+                    self._disc_sock.sendto(payload, ("127.0.0.1", p))
                 except Exception:
                     pass
-        # 同机多开时广播可能不通，补一轮本机单播，保证自己人一定能互相看见
-        for p in range(DISC_PORT_BASE, DISC_PORT_BASE + DISC_PORT_SPAN):
-            try:
-                self._disc_sock.sendto(payload, ("127.0.0.1", p))
-            except Exception:
-                pass
+            if _round == 0:
+                time.sleep(0.3)
         deadline = time.time() + max(0.3, timeout)
         while time.time() < deadline:
             time.sleep(0.1)
@@ -2137,11 +2301,20 @@ def diag():
         print("           请执行：sudo apt install python3-tk")
 
     t0 = time.time()
-    ips = get_local_ips()
+    nics = _collect_nets()
+    ips = [n[0] for n in nics] or ["127.0.0.1"]
     print("本机 IP   : %s（探测耗时 %.2f 秒）" % ("、".join(ips),
                                             time.time() - t0))
     if ips == ["127.0.0.1"]:
-        print("           警告：没拿到局域网 IP，可能网线/WiFi 未连接")
+        print("           警告：没拿到局域网 IP —— 检查网线/WiFi 是否连上、")
+        print("           是否拿到了 IP（终端里 ip addr 或 设置→网络 里看）")
+    if nics:
+        print("网卡明细  :")
+        for ip, bits, bcast, name, method in nics:
+            print("           %-15s /%-2d  广播 %-15s %-9s [%s]"
+                  % (ip, bits, bcast, name or "-", method))
+    else:
+        print("网卡明细  : 一张都没识别出来（ioctl/ip/ifconfig/ipconfig 全失败）")
 
     for port in (DEFAULT_PORT, DEFAULT_PORT + 1):
         try:
@@ -3065,7 +3238,14 @@ class ChatWindow(QMainWindow):
         top.addWidget(QLabel("本机 IP"))
         self.ip_combo = QComboBox()
         self.ip_combo.setFixedWidth(140)
+        self.ip_combo.setToolTip(
+            "把这个 IP 告诉对方。\n若显示 127.0.0.1，说明没识别到网卡，"
+            "点「刷新 IP」重试。")
         top.addWidget(self.ip_combo)
+        self.btn_ip = QPushButton("刷新 IP")
+        self.btn_ip.setFixedWidth(70)
+        self.btn_ip.clicked.connect(self.refresh_ips)
+        top.addWidget(self.btn_ip)
 
         top.addWidget(QLabel("端口"))
         self.port_edit = QLineEdit(str(self.cfg.get("port", DEFAULT_PORT)))
@@ -3273,11 +3453,10 @@ class ChatWindow(QMainWindow):
 
     def refresh_ips(self):
         self.ip_combo.clear()
-        self.ip_combo.addItem("127.0.0.1")
+        self.ip_combo.addItem("检测中…")
 
         def work():
             ips = get_local_ips()
-            self.ctrl.bridge.status.emit("本机 IP：" + "、".join(ips))
             QTimer.singleShot(0, lambda: self._set_ips(ips))
 
         threading.Thread(target=work, daemon=True).start()
@@ -3288,6 +3467,15 @@ class ChatWindow(QMainWindow):
             self.ip_combo.addItem(ip)
         if ips:
             self.ip_combo.setCurrentIndex(0)
+        if not ips or ips == ["127.0.0.1"]:
+            self.ctrl.bridge.status.emit("没识别到局域网 IP（只有 127.0.0.1）")
+            self.sys_msg(
+                "⚠ 没识别到局域网 IP：请确认网线/WiFi 已连上并拿到了 IP，"
+                "然后点「刷新 IP」。")
+            self.sys_msg("  还是不行就跑一次诊断看详情："
+                         "python3 摸鱼鸭聊天版.py --diag")
+            return
+        self.ctrl.bridge.status.emit("本机 IP：" + "、".join(ips))
 
     # ---------------- 监听 ----------------
     def auto_start(self):
@@ -3355,13 +3543,22 @@ class ChatWindow(QMainWindow):
         if spec:
             nets.append(spec)
         if not nets:
-            for ip, _b, _c in get_local_nets(timeout=1.5):
+            for ip, bits, _c in get_local_nets(timeout=1.5):
                 if ip.startswith("127."):
                     continue
+                # 掩码比 /24 大时按真实网段来，否则会漏掉同网段的机器
+                if bits and bits < 24:
+                    try:
+                        import ipaddress
+                        nets.append(str(ipaddress.IPv4Network(
+                            "%s/%d" % (ip, bits), strict=False)))
+                        continue
+                    except Exception:
+                        pass
                 nets.append(".".join(ip.split(".")[:3]))
         if not nets:
-            self.sys_msg("没检测到局域网 IP，无法扫描；可在「网段」里手填，"
-                         "例如 192.168.5")
+            self.sys_msg("没检测到局域网 IP，无法扫描：先点「刷新 IP」确认能拿到 IP；"
+                         "也可以直接在「网段」里手填，例如 192.168.5")
             return
         try:
             port = int(self.peer_port.text().strip() or DEFAULT_PORT)
