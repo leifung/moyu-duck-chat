@@ -623,12 +623,34 @@ def build_report(extra=None, tail_lines=400):
     return "\n".join(line)
 
 
+def app_dir():
+    """程序所在目录。诊断报告默认导出到这儿，方便直接找到。
+
+    目录不存在或不可写（比如装在只读位置）时，退回当前目录，再退回家目录。
+    """
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        d = ""
+    if not d or not os.path.isdir(d):
+        try:
+            d = os.path.abspath(os.getcwd())
+        except Exception:
+            d = ""
+    try:
+        if not d or not os.access(d, os.W_OK):
+            d = os.path.expanduser("~")
+    except Exception:
+        d = os.path.expanduser("~")
+    return d
+
+
 def save_report(extra=None, path=None):
-    """把报告写成文本文件，返回路径。默认放在家目录。"""
+    """把报告写成文本文件，返回路径。默认放在程序所在目录。"""
     txt = build_report(extra)
     if not path:
         path = os.path.join(
-            os.path.expanduser("~"),
+            app_dir(),
             "摸鱼鸭诊断报告-%s.txt"
             % datetime.now().strftime("%Y%m%d-%H%M%S"))
     with open(path, "w", encoding="utf-8") as f:
@@ -790,6 +812,50 @@ def probe_port(ip, port, timeout=0.45):
                 s.close()
         except Exception:
             pass
+
+
+def ping_host(ip, timeout=1):
+    """ping 一下，看这台机器能不能通。Linux/Windows 参数不同，分别处理。"""
+    import subprocess
+    try:
+        if os.name == "nt":
+            cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(int(timeout) or 1), ip]
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=timeout + 2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def ping_sample(ips, timeout=1):
+    """并发 ping 一批地址，返回 [(ip, 是否通), ...]（保持原顺序）。"""
+    ips = [x for x in ips if x]
+    out = {}
+    lock = threading.Lock()
+    q = queue.Queue()
+    for ip in ips:
+        q.put(ip)
+
+    def work():
+        while True:
+            try:
+                ip = q.get_nowait()
+            except queue.Empty:
+                return
+            alive = ping_host(ip, timeout)
+            with lock:
+                out[ip] = alive
+
+    n = max(1, min(8, len(ips)))
+    ths = [threading.Thread(target=work, daemon=True) for _ in range(n)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    return [(ip, bool(out.get(ip))) for ip in ips]
 
 
 def tcp_scan(node, targets, ports, workers=120, conn_timeout=1.0,
@@ -2806,6 +2872,30 @@ def diag():
     except Exception as e:
         print("同网段在线: 读取 ARP 失败 -> %s" % e)
 
+    # 抽样 ping 同网段邻居：判断「客户端之间到底能不能通」
+    # ARP 表里有 ≠ 能通信，很多办公网做了二层隔离（端口隔离/AP 隔离）
+    try:
+        sample = [x[0] for x in same][:6]
+    except Exception:
+        sample = []
+    if sample:
+        print("连通性抽样: 正在 ping %d 台同网段邻居（每台 1 秒）…"
+              % len(sample))
+        res = ping_sample(sample)
+        ok = [ip for ip, alive in res if alive]
+        for ip, alive in res:
+            print("            %-15s %s" % (ip, "通" if alive else "不通"))
+        print("          小结：%d/%d 台能 ping 通" % (len(ok), len(res)))
+        if not ok:
+            print("          ※ 一台都 ping 不通，但 ARP 表里却有这么多机器 ——")
+            print("            典型的「客户端隔离」，广播和扫描都会被掐掉。")
+            print("            这种情况只能请网管放通，或改用「对方 IP」直连试试。")
+        elif len(ok) < len(res):
+            print("          ※ 部分能通：网络做了选择性隔离，"
+                  "能通的那些可以直连，不通的只能找网管。")
+        else:
+            print("          ※ 都能通：网络没做隔离，"
+                  "扫不到人基本就是对方没开程序或端口不对。")
     print("日志文件  : %s" % LOG_PATH)
     print("-" * 58)
     print("要发给开发看：python3 摸鱼鸭聊天版.py --report 导出诊断报告")

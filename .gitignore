@@ -3,3 +3,7 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+# 运行时产物：运行日志与导出到程序目录的诊断报告，不要进仓库
+摸鱼鸭诊断报告-*.txt
+*.log
