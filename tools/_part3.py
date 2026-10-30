@@ -147,9 +147,17 @@ def fished_text(start_hour):
 
 
 class Bridge(QObject):
-    """子线程 -> 主线程 的信号桥"""
+    """子线程 -> 主线程 的信号桥
+
+    ui 这个信号用来「从工作线程把一段代码丢回主线程执行」。
+    千万别在工作线程里用 QTimer.singleShot 干这事 —— 普通
+    threading.Thread 里没有 Qt 事件循环，定时器永远不触发，
+    界面会一直卡住（本机 IP 停在「检测中…」、扫描按钮停在「扫描中…」）。
+    """
     event = _Sig(object)
     status = _Sig(str)
+    ips = _Sig(object)      # 本机 IP 列表（子线程算完 -> 主线程填下拉框）
+    ui = _Sig(object)       # 一个 callable，由主线程执行
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +870,10 @@ class ChatWindow(QMainWindow):
                      "点「连接」，也可以点「扫描局域网」自动发现。")
         self.sys_msg("收到消息时，桌面小鸭子会跑去把消息变成的小鱼吃掉 —— "
                      "不想被打扰可在「摸鱼鸭」菜单里关掉。")
+        try:
+            self.ctrl.bridge.ips.connect(self._set_ips)
+        except Exception:
+            pass
         self.refresh_ips()
         self.auto_start()
 
@@ -1154,8 +1166,16 @@ class ChatWindow(QMainWindow):
         self.ip_combo.addItem("检测中…")
 
         def work():
-            ips = get_local_ips()
-            QTimer.singleShot(0, lambda: self._set_ips(ips))
+            # 注意：这里绝不能用 QTimer.singleShot 回主线程 ——
+            # 本函数是普通 threading.Thread，线程里没有 Qt 事件循环，
+            # 定时器永远不会触发，界面就会一直卡在「检测中…」。
+            # （PyQt 5.11 上必现。）必须用信号跨线程回主线程。
+            ips = []
+            try:
+                ips = get_local_ips()
+            except Exception:
+                log_line("获取本机 IP 出错", exc=True)
+            self.ctrl.bridge.ips.emit(list(ips))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1254,8 +1274,9 @@ class ChatWindow(QMainWindow):
                 pass
             myself = _re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and \
                 ip in [x for x in get_local_ips()]
-            QTimer.singleShot(0, lambda: self._connect_fail_hint(
-                ip, port_i, state, bool(myself), my_port))
+            self.ctrl.bridge.ui.emit(
+                lambda: self._connect_fail_hint(
+                    ip, port_i, state, bool(myself), my_port))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1343,6 +1364,14 @@ class ChatWindow(QMainWindow):
             try:
                 for h in self.node.discover(timeout=2.0, extra_nets=nets):
                     ip = h.get("ip")
+                    if h.get("self") or is_myself(ip):
+                        # 本机另一个实例应答了广播：连自己没意义，
+                        # 顺带提醒用户把多余的实例退掉
+                        self.ctrl.bridge.ui.emit(lambda ip=ip: self.sys_msg(
+                            "跳过 %s：那是本机上的另一个本程序实例，不是同事。"
+                            "你可能开了多个 —— 建议退出多余的只留一个。"
+                            % ip))
+                        continue
                     ok = (not stop.is_set()) and self.node.connect(
                         ip, h.get("port") or my_port, timeout=3, quiet=True)
                     seen[ip] = {"ok": ok, "name": h.get("name", ""),
@@ -1361,7 +1390,7 @@ class ChatWindow(QMainWindow):
                 targets = []
                 for n in nets:
                     for t in expand_targets(n):
-                        if t not in targets:
+                        if t not in targets and not is_myself(t):
                             targets.append(t)
                 self.ctrl.bridge.status.emit(
                     "广播无应答，改为逐个尝试 %d 个地址 …" % len(targets))
@@ -1375,7 +1404,9 @@ class ChatWindow(QMainWindow):
                         seen[hit["ip"]] = {"ok": True, "name": "", "via": "扫描"}
                 except Exception:
                     pass
-            QTimer.singleShot(0, lambda: self.scan_done(seen, nets, before, deep))
+            # 回到主线程再收尾（工作线程里不能用 QTimer.singleShot）
+            self.ctrl.bridge.ui.emit(
+                lambda: self.scan_done(seen, nets, before, deep))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1649,7 +1680,7 @@ class ChatWindow(QMainWindow):
             def run_g():
                 n = self.node.send_group_file(gid, path)
                 self.ctrl.bridge.status.emit("就绪")
-                QTimer.singleShot(0, lambda: self.append_msg(
+                self.ctrl.bridge.ui.emit(lambda: self.append_msg(
                     "ok" if n else "err",
                     ("群文件已发给 %d 位成员：%s" % (n, name)) if n
                     else "没有可发送的群成员（成员都不在线）", key=key))
@@ -1852,6 +1883,7 @@ class Controller(object):
         self.bridge = Bridge()
         self.bridge.event.connect(self.handle_event)
         self.bridge.status.connect(self._on_status)
+        self.bridge.ui.connect(self._run_on_ui)
         self.node = ChatNode(on_event=self.on_node_event,
                              nickname=cfg.get("nickname", ""))
         self.tray = None
@@ -1886,6 +1918,13 @@ class Controller(object):
     # -- 通信内核回调（子线程） --------------------------------------------
     def on_node_event(self, ev):
         self.bridge.event.emit(ev)
+
+    def _run_on_ui(self, fn):
+        """执行工作线程丢回来的代码（本槽一定在主线程）"""
+        try:
+            fn()
+        except Exception:
+            log_line("主线程回调出错", exc=True)
 
     def _on_status(self, text):
         self.win.set_status(text)

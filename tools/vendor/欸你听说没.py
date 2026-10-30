@@ -814,6 +814,32 @@ def probe_port(ip, port, timeout=0.45):
             pass
 
 
+_MY_IP_CACHE = {"t": 0.0, "ips": set()}
+
+
+def my_ip_set(ttl=5.0):
+    """本机所有 IP（带 5 秒缓存，供「别把自己当陌生人」判断用）。"""
+    now = time.time()
+    if now - _MY_IP_CACHE["t"] > ttl or not _MY_IP_CACHE["ips"]:
+        try:
+            _MY_IP_CACHE["ips"] = set(get_local_ips())
+        except Exception:
+            pass
+        _MY_IP_CACHE["t"] = now
+    return _MY_IP_CACHE["ips"]
+
+
+def is_myself(ip):
+    """这个 IP 是不是本机（含同机多开时走 127.0.0.1 的情况）。"""
+    ip = (ip or "").strip()
+    if not ip or ip == "127.0.0.1" or ip == "::1" or ip == "localhost":
+        return True
+    try:
+        return ip in my_ip_set()
+    except Exception:
+        return False
+
+
 def ping_host(ip, timeout=1):
     """ping 一下，看这台机器能不能通。Linux/Windows 参数不同，分别处理。"""
     import subprocess
@@ -1244,11 +1270,19 @@ class ChatNode(object):
                 except Exception:
                     pass
             elif kind == HERE_MAGIC:
+                _self = is_myself(addr[0])
                 info = {"uuid": who, "ip": addr[0],
                         "port": int(msg.get("port") or DEFAULT_PORT),
-                        "name": msg.get("name", "")}
+                        "name": msg.get("name", ""),
+                        "self": _self}
                 with self._disc_lock:
                     self._disc_hits[who] = info
+                if _self:
+                    # 同机多开时，自己另一个实例会应答广播，不加区分就会
+                    # 「连上自己」，让人误以为找到同事了
+                    log_line("广播应答：%s:%s（%s）—— 是本机上的另一个实例，"
+                             "不算对方" % (addr[0], info["port"],
+                                          info["name"] or "?"))
                 self.emit("discovered", **info)
 
     def discover(self, timeout=2.0, extra_nets=None):
