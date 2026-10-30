@@ -1196,6 +1196,11 @@ class ChatWindow(QMainWindow):
                 if port != base:
                     self.sys_msg("端口 %d 被占用，已自动改用 %d，"
                                  "请告诉对方这个端口。" % (base, port))
+                    if port - base >= 3:
+                        self.sys_msg(
+                            "  注意：连着 %d 个端口都被占，很可能是你已经开了好几个"
+                            "本程序（或旧版聊天程序还在后台）。多开会互相抢消息，"
+                            "建议退出多余的实例，只留一个。" % (port - base))
                 self.sys_msg("已启动监听，端口 %d。把本机 IP 告诉对方即可。"
                              % self.node.port)
                 self.refresh_list()
@@ -1333,13 +1338,29 @@ class ChatWindow(QMainWindow):
                          "请在对方电脑放行后再试。"
                          % ("、".join(sorted(bad_ips)), self.node.port))
         else:
-            hint = ["双方都要先点「启动监听」",
-                    "确认在同一网段（本机网段：%s）" % "、".join(nets),
-                    "对方防火墙放行 %d 端口" % (self.node.port or DEFAULT_PORT)]
-            if not deep:
-                hint.append("可勾选「深度」再扫一次（会尝试 %d~%d 全部端口）"
-                            % (DEFAULT_PORT, DEFAULT_PORT + PORT_SPAN - 1))
-            self.sys_msg("没找到其它电脑。请检查：" + "；".join(hint))
+            onl = list(LAST_SCAN.get("online", []) or [])
+            if onl:
+                shown = "、".join(onl[:12]) + ("…" if len(onl) > 12 else "")
+                self.sys_msg(
+                    "同网段探到 %d 台在线电脑（%s），但没有一台在 %d 端口上开着本程序。"
+                    % (len(onl), shown, self.node.port or DEFAULT_PORT))
+                self.sys_msg("  → 网络是通的，问题在软件。请让对方：① 点「启动监听」；"
+                             "② 看他界面上显示的端口是多少（不一定是 %d），报给你；"
+                             "③ 放行该端口。"
+                             % (self.node.port or DEFAULT_PORT))
+                self.sys_msg("  最稳的办法：把对方的 IP 和端口填进上面的"
+                             "「对方 IP / 端口」直接连接，别靠扫描。")
+            else:
+                hint = ["双方都要先点「启动监听」",
+                        "确认在同一网段（本机网段：%s）" % "、".join(nets),
+                        "对方防火墙放行 %d 端口" % (self.node.port or DEFAULT_PORT)]
+                if not deep:
+                    hint.append("可勾选「深度」再扫一次（会尝试 %d~%d 全部端口）"
+                                % (DEFAULT_PORT, DEFAULT_PORT + PORT_SPAN - 1))
+                self.sys_msg("没找到其它电脑。请检查：" + "；".join(hint))
+                self.sys_msg("  一个在线主机都没探到，也可能是办公网做了"
+                             "「客户端隔离」—— 这种情况下扫描永远扫不到，"
+                             "只能用「对方 IP」直连。")
         self.statusBar().showMessage("就绪")
         self.refresh_list()
 

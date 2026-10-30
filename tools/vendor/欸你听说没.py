@@ -482,6 +482,30 @@ def install_log_hooks():
         pass
 
 
+def _compress_fail_lines(lines, keep_head=8, keep_tail=8, threshold=40):
+    """日志里「连接 x.x.x.x:port 失败」在扫大网段时会有上千条，
+    把中间重复的压掉，只留头尾各几条 + 一条统计，避免把关键事件挤没了。"""
+    try:
+        idx = [i for i, ln in enumerate(lines)
+               if "连接 " in ln and " 失败" in ln]
+        if len(idx) <= threshold:
+            return lines
+        keep = set(idx[:keep_head]) | set(idx[-keep_tail:])
+        out = []
+        omitted = 0
+        last_kept = idx[-keep_tail]
+        for i, ln in enumerate(lines):
+            if i in idx and i not in keep:
+                omitted += 1
+                continue
+            out.append(ln)
+            if i == last_kept and omitted:
+                out.append("  （此处省略 %d 条同类「连接失败」记录）" % omitted)
+        return out
+    except Exception:
+        return lines
+
+
 def build_report(extra=None, tail_lines=400):
     """生成诊断报告文本：环境 + 网卡 + 端口 + 运行状态 + 最近日志。"""
     import platform
@@ -550,11 +574,40 @@ def build_report(extra=None, tail_lines=400):
         for ln in extra:
             add("  " + str(ln))
 
+    # ARP 邻居表：不用扫描就能知道同网段谁活着，判「扫不到人」时最关键
+    try:
+        neigh = arp_neighbors()
+        mine = set()
+        for ip, _b, _c, _n, _m in _collect_nets():
+            mine.add(".".join(ip.split(".")[:3]))
+        same = [n for n in neigh
+                if ".".join(n[0].split(".")[:3]) in mine or not mine]
+        add("")
+        add("【同网段在线主机 · ARP 邻居表】")
+        if same:
+            add("  共 %d 台（括号内是网卡/类型）：" % len(same))
+            for ip, mac, dev in same[:60]:
+                add("    %-15s %-18s %s" % (ip, mac, dev))
+            if len(same) > 60:
+                add("    ……另有 %d 台未列出" % (len(same) - 60))
+            add("  ※ 对方电脑的 IP 应该出现在这里；不在说明它不在这个网段，"
+                "扫是扫不到的，要用「对方 IP」直连。")
+        else:
+            add("  （邻居表为空：本机最近没和任何同网段机器通过话，"
+                "或网络做了二层隔离）")
+    except Exception as e:
+        add("")
+        add("【同网段在线主机 · ARP 邻居表】")
+        add("  读取失败：%r" % (e,))
+
     add("")
     add("【最近日志 · %s】" % LOG_PATH)
     try:
         with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
+        # 扫大网段会产生上千条「连接 x 失败」，压掉中间部分，
+        # 否则关键事件（广播结果、扫描汇总）会被挤出最近 N 行
+        lines = _compress_fail_lines(lines)
         if lines:
             for ln in lines[-tail_lines:]:
                 add("  " + ln)
@@ -631,51 +684,251 @@ def expand_targets(spec, limit=1024):
     return []
 
 
-def tcp_scan(node, targets, ports, workers=100, conn_timeout=1.0,
-             hello_timeout=1.5, progress=None, stop=None):
-    """对「IP × 端口」逐个尝试真实握手，返回命中的设备列表。
-    直接握手而不是连一下就断开：既能在命中时立刻建立连接，
-    也不会在对方机器上留下大量半开连接。
+LAST_SCAN = {"online": [], "hits": [], "ports": [], "scanned": 0,
+             "dead": 0, "closed": 0}
+
+
+def _is_arp_noise(ip):
+    """广播地址、组播地址、全零 —— 不该算作「一台电脑」"""
+    try:
+        b = [int(x) for x in ip.split(".")]
+    except Exception:
+        return True
+    if len(b) != 4:
+        return True
+    if b[0] >= 224:                      # 组播 / 保留
+        return True
+    if b[3] in (0, 255):                 # 网络号 / 广播
+        return True
+    return False
+
+
+def arp_neighbors(limit=200):
+    """读系统 ARP 邻居表，返回 [(ip, mac, dev), ...]。
+
+    Linux 直接读 /proc/net/arp（不需要 root，也不需要外部命令）；
+    Windows 走 arp -a。只保留状态为「可达」的条目。
+    这张表能直接告诉我们：同网段里有哪些机器是活的、并且最近通过话。
     """
-    jobs = queue.Queue()
-    for ip in targets:
-        for p in ports:
-            jobs.put((ip, p))
-    total = jobs.qsize()
+    out = []
+    seen = set()
+    try:
+        if os.path.exists("/proc/net/arp"):
+            with open("/proc/net/arp", "r", encoding="utf-8",
+                      errors="replace") as f:
+                next(f, None)                       # 跳过表头
+                for ln in f:
+                    parts = ln.split()
+                    if len(parts) < 6:
+                        continue
+                    ip, _hw, flags, mac, _mask, dev = parts[:6]
+                    try:
+                        if not (int(flags, 16) & 0x2):     # 0x2 = 已完成
+                            continue
+                    except Exception:
+                        pass
+                    if not mac or mac.lower().startswith("00:00:00:00:00:00"):
+                        continue
+                    if ip.startswith("127.") or ip in seen or _is_arp_noise(ip):
+                        continue
+                    seen.add(ip)
+                    out.append((ip, mac, dev))
+                    if len(out) >= limit:
+                        return out
+            return out
+    except Exception:
+        pass
+    try:
+        import subprocess
+        res = subprocess.run(["arp", "-a"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=6)
+        raw = res.stdout
+        txt = None
+        for enc in ("utf-8", "gbk", "mbcs", "latin-1"):
+            try:
+                txt = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        txt = txt or raw.decode("utf-8", "ignore")
+        # 只取 IP 和 MAC，不要后面的「动态/静态」—— 中文 Windows 下
+        # 这段是本地代码页输出，解码很容易乱，而我们并不需要它
+        for m in re.finditer(
+                r"(\d+\.\d+\.\d+\.\d+)\s+"
+                r"((?:[0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2})", txt):
+            ip, mac = m.group(1), m.group(2)
+            if ip.startswith("127.") or ip in seen or _is_arp_noise(ip):
+                continue
+            seen.add(ip)
+            out.append((ip, mac, "arp"))
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def probe_port(ip, port, timeout=0.45):
+    """只探端口开没开，不做握手。
+    返回 'open'（端口在监听）/ 'closed'（主机在线但端口没开）/
+         'dead'（没响应，多半不存在或被防火墙丢包）。"""
+    s = None
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        return "open"
+    except Exception as e:
+        code = getattr(e, "errno", None)
+        wcode = getattr(e, "winerror", None)
+        msg = str(e).lower()
+        if code in (111, 61, 10061) or wcode in (10061, 1225) \
+                or "refus" in msg or "拒绝" in msg:
+            return "closed"
+        return "dead"
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+
+
+def tcp_scan(node, targets, ports, workers=120, conn_timeout=1.0,
+             hello_timeout=1.5, progress=None, stop=None,
+             probe_timeout=0.45):
+    """两阶段扫描，返回命中的设备列表。
+
+    阶段一：只用 ports[0] 快速摸一遍所有 IP，把主机分成
+            「端口开着 / 在线但端口关 / 完全无响应」；
+    阶段二：只对「在线」的主机补扫其余端口。
+
+    这样扫一个 /24 只需 254 次连接（原来 254×5 = 1270 次），
+    快 5 倍，也不会在办公网里留下成片的连接记录。
+    """
+    ports = list(ports)
+    targets = list(targets)
+    if not ports or not targets:
+        return []
+    head, rest = ports[0], ports[1:]
+
     hits = []
+    online = []
+    n_dead = [0]
+    n_closed = [0]
     lock = threading.Lock()
     done = [0]
+    total = len(targets)
+    q = queue.Queue()
+    for ip in targets:
+        q.put(ip)
 
-    def worker():
+    def tick():
+        if progress:
+            try:
+                progress(done[0], total)
+            except Exception:
+                pass
+
+    def phase1():
         while True:
             if stop is not None and stop.is_set():
                 return
             try:
-                ip, p = jobs.get_nowait()
+                ip = q.get_nowait()
+            except queue.Empty:
+                return
+            state = "dead"
+            try:
+                state = probe_port(ip, head, probe_timeout)
+            except Exception:
+                state = "dead"
+            with lock:
+                done[0] += 1
+                if state == "open":
+                    online.append(ip)
+                    if node.connect(ip, head, timeout=conn_timeout,
+                                    quiet=True, log=False,
+                                    hello_timeout=hello_timeout):
+                        hits.append({"ip": ip, "port": head})
+                elif state == "closed":
+                    online.append(ip)
+                    n_closed[0] += 1
+                else:
+                    n_dead[0] += 1
+                if done[0] % 20 == 0 or done[0] == total:
+                    tick()
+
+    def phase2(pool):
+        q2 = queue.Queue()
+        for ip in pool:
+            for p in rest:
+                q2.put((ip, p))
+        while True:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                ip, p = q2.get_nowait()
             except queue.Empty:
                 return
             try:
-                ok = node.connect(ip, p, timeout=conn_timeout, quiet=True,
-                                  hello_timeout=hello_timeout)
+                if probe_port(ip, p, probe_timeout) != "open":
+                    continue
             except Exception:
-                ok = False
-            if ok:
+                continue
+            if node.connect(ip, p, timeout=conn_timeout, quiet=True,
+                            log=False, hello_timeout=hello_timeout):
                 with lock:
                     hits.append({"ip": ip, "port": p})
-            with lock:
-                done[0] += 1
-                if progress and (done[0] % 10 == 0 or done[0] == total):
-                    try:
-                        progress(done[0], total)
-                    except Exception:
-                        pass
 
     n = max(1, min(workers, total))
-    ths = [threading.Thread(target=worker, daemon=True) for _ in range(n)]
+    ths = [threading.Thread(target=phase1, daemon=True) for _ in range(n)]
     for t in ths:
         t.start()
     for t in ths:
         t.join()
+    # 有些系统的防火墙对「端口没开」不回 RST 而是直接把包丢掉，
+    # 结果全部被判成 dead，在线主机一个都认不出来。
+    # 用 ARP 邻居表兜底：表里出现的机器一定是活的。
+    arp_alive = set()
+    try:
+        arp_alive = set(x[0] for x in arp_neighbors())
+    except Exception:
+        pass
+    alive = set(online) | (arp_alive & set(targets))
+    alive.discard("")
+    pool = sorted(alive)
+
+    if rest and pool and (stop is None or not stop.is_set()):
+        n2 = max(1, min(workers, len(pool) * len(rest)))
+        ths2 = [threading.Thread(target=phase2, daemon=True, args=(pool,))
+                for _ in range(n2)]
+        for t in ths2:
+            t.start()
+        for t in ths2:
+            t.join()
+
+    LAST_SCAN.update({
+        "online": pool,
+        "hits": [h["ip"] for h in hits],
+        "ports": ports,
+        "scanned": total,
+        "dead": n_dead[0],
+        "closed": n_closed[0],
+    })
+    brief = "、".join(pool[:40])
+    if len(pool) > 40:
+        brief += " …"
+    log_line("扫描：%d 个地址，先探端口 %d -> 端口开着并连上 %d 台、"
+             "在线但端口没开 %d 台、无响应 %d 个"
+             % (total, head, len(hits), n_closed[0], n_dead[0]))
+    if pool:
+        log_line("      同网段在线主机 %d 台：%s" % (len(pool), brief))
+    else:
+        log_line("      一个在线主机都没认出来 —— 多半是网络做了隔离/禁 ARP，"
+                 "或者防火墙把探测包全丢了")
+    if rest and pool:
+        log_line("      对在线主机补探端口 %s -> 再命中 %d 台"
+                 % ("/".join(str(p) for p in rest),
+                    len([h for h in hits if h["port"] != head])))
     return hits
 
 
@@ -1017,11 +1270,14 @@ class ChatNode(object):
                              daemon=True).start()
 
     # ---------------- 主动连接 ----------------
-    def connect(self, ip, port, timeout=8, quiet=False, hello_timeout=None):
+    def connect(self, ip, port, timeout=8, quiet=False, hello_timeout=None,
+                log=True):
         ip = (ip or "").strip()
 
         def fail(msg):
-            log_line("连接 %s:%s 失败：%s" % (ip, port, msg))
+            # 扫大网段时失败会有上千条，逐条写会刷爆日志，故可关掉
+            if log:
+                log_line("连接 %s:%s 失败：%s" % (ip, port, msg))
             if not quiet:
                 self.emit("error", msg=msg)
             return False
@@ -2528,6 +2784,27 @@ def diag():
         n.stop_discovery()
     except Exception as e:
         print("广播测试  : 异常 -> %s" % e)
+
+    # ARP 邻居：不扫描就能看出同网段谁活着
+    try:
+        neigh = arp_neighbors()
+        mine = set(".".join(n[0].split(".")[:3])
+                   for n in nets if not n[0].startswith("127."))
+        same = [x for x in neigh
+                if not mine or ".".join(x[0].split(".")[:3]) in mine]
+        print("同网段在线: %d 台（来自 ARP 邻居表，没做任何扫描）" % len(same))
+        for ip, mac, dev in same[:40]:
+            print("            - %-15s %-18s %s" % (ip, mac, dev))
+        if len(same) > 40:
+            print("            ……另有 %d 台未列出" % (len(same) - 40))
+        if not same:
+            print("            （空 = 本机最近没和同网段任何机器通过话，"
+                  "或网络做了二层隔离/禁 ARP）")
+        else:
+            print("            ※ 对方的 IP 应该出现在这张表里；"
+                  "不在这张表里说明它不在这个网段，扫描是找不到的")
+    except Exception as e:
+        print("同网段在线: 读取 ARP 失败 -> %s" % e)
 
     print("日志文件  : %s" % LOG_PATH)
     print("-" * 58)
